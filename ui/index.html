@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Multi-Strategy Lighting Experiment</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%2310131a'/><rect x='4' y='3' width='8' height='5' fill='%23e8b44a'/><circle cx='8' cy='12' r='2.5' fill='%234a9de8'/></svg>" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <h1>Multi-Strategy Lighting Experiment</h1>
+  <div class="topbar-readout" id="status-readout">idle</div>
+</header>
+
+<main class="layout">
+  <!-- Left: controls -->
+  <section class="panel controls" aria-label="Lighting controls">
+    <div class="group">
+      <h2>Exposure</h2>
+      <div class="row">
+        <label for="boundary-u0">Bright zone u0</label>
+        <input id="boundary-u0" type="range" min="0.02" max="0.95" step="0.01" value="0.12" />
+        <output id="boundary-u0-out">0.12</output>
+      </div>
+      <div class="row">
+        <label for="boundary-u1">Bright zone u1</label>
+        <input id="boundary-u1" type="range" min="0.02" max="0.98" step="0.01" value="0.62" />
+        <output id="boundary-u1-out">0.62</output>
+      </div>
+      <div class="row">
+        <label for="boundary-v1">Bright zone height v1</label>
+        <input id="boundary-v1" type="range" min="0.05" max="0.98" step="0.01" value="0.92" />
+        <output id="boundary-v1-out">0.92</output>
+      </div>
+      <div class="row">
+        <button id="new-exposure" class="primary">Set new exposure boundary</button>
+      </div>
+      <p class="hint">Shrink the zone to keep the old table (reweight); grow it into area the old table never emitted to force a discard. The decision panel says which happened and why.</p>
+    </div>
+
+    <div class="group">
+      <h2>Light board</h2>
+      <div class="row">
+        <label for="light-scale">Light size</label>
+        <input id="light-scale" type="range" min="0.4" max="1.6" step="0.05" value="1" />
+        <output id="light-scale-out">1.00×</output>
+      </div>
+      <div class="row">
+        <label for="light-shift">Move light (x)</label>
+        <input id="light-shift" type="range" min="-0.8" max="0.8" step="0.02" value="0" />
+        <output id="light-shift-out">0.00</output>
+      </div>
+      <div class="row two">
+        <div class="mini">
+          <label for="sphere-rough">Sphere roughness</label>
+          <input id="sphere-rough" type="range" min="0.03" max="0.9" step="0.01" value="0.18" />
+          <output id="sphere-rough-out">0.18</output>
+        </div>
+        <div class="mini">
+          <label for="sphere-metal">Metallic</label>
+          <input id="sphere-metal" type="range" min="0" max="1" step="0.01" value="0.85" />
+          <output id="sphere-metal-out">0.85</output>
+        </div>
+      </div>
+      <div class="row">
+        <button id="apply-scene">Apply scene changes</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2>Estimator</h2>
+      <div class="row seg" role="group" aria-label="Strategy">
+        <button data-strategy="combined" class="active">Combined (MIS)</button>
+        <button data-strategy="light">Light only</button>
+        <button data-strategy="material">Material only</button>
+      </div>
+      <div class="row">
+        <label for="spp">Samples / pixel</label>
+        <input id="spp" type="range" min="1" max="256" step="1" value="24" />
+        <output id="spp-out">24</output>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2>Run</h2>
+      <div class="row">
+        <button id="start" class="primary">Start sampling</button>
+        <button id="stop" disabled>Stop</button>
+      </div>
+      <div class="row">
+        <button id="show-ref">Toggle reference overlay</button>
+        <button id="run-audit">Measure audit</button>
+      </div>
+      <p class="hint" id="audit-out">—</p>
+    </div>
+
+    <div class="group">
+      <h2>Deterministic check</h2>
+      <div class="row">
+        <button id="validate">Run unbiasedness check</button>
+      </div>
+      <p class="hint" id="validate-out">Runs several independent seeds at this exposure and compares their mean to the deterministic per-region quadrature.</p>
+    </div>
+  </section>
+
+  <!-- Centre: images -->
+  <section class="panel view" aria-label="Rendered results">
+    <div class="canvas-stack">
+      <figure>
+        <figcaption>Lighting image <span class="badge" id="img-spp">—</span></figcaption>
+        <div class="canvas-wrap">
+          <canvas id="view-image" width="384" height="256"></canvas>
+          <canvas id="view-overlay" width="384" height="256" class="overlay hidden"></canvas>
+          <div class="progress" id="progress"><div class="bar" id="progress-bar"></div></div>
+        </div>
+      </figure>
+    </div>
+    <div class="metrics" id="metrics">
+      <div><span>mean L</span><b id="m-mean">—</b></div>
+      <div><span>relative noise</span><b id="m-noise">—</b></div>
+      <div><span>ms / pass</span><b id="m-ms">—</b></div>
+      <div><span>samples</span><b id="m-spp">—</b></div>
+    </div>
+    <div class="legend">
+      <span><i class="sw sw-img"></i> tonal-mapped estimate</span>
+      <span><i class="sw sw-err"></i> error vs fixed-seed reference</span>
+    </div>
+  </section>
+
+  <!-- Right: diagnostics -->
+  <section class="panel diag" aria-label="Diagnostics">
+    <div class="group">
+      <h2>Proposal / decision</h2>
+      <div id="decision" class="decision">—</div>
+    </div>
+    <div class="group">
+      <h2>Per-region energy</h2>
+      <table class="energy" id="energy-table">
+        <thead><tr><th>region</th><th>quadrature</th><th>sampler</th><th>Δ</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="group">
+      <h2>Selected light path</h2>
+      <div class="row two">
+        <div class="mini">
+          <label for="probe-x">Probe pixel x</label>
+          <input id="probe-x" type="range" min="0" max="383" step="1" value="80" />
+          <output id="probe-x-out">80</output>
+        </div>
+        <div class="mini">
+          <label for="probe-y">y</label>
+          <input id="probe-y" type="range" min="0" max="255" step="1" value="150" />
+          <output id="probe-y-out">150</output>
+        </div>
+      </div>
+      <div id="path-list" class="paths">Start sampling to inspect paths at the probe pixel.</div>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <span id="engine-status">Engine ready.</span>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -23,3 +23,7 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# Browser smoke-test output
+/tools/ui-screenshot.png
+/tools/ui-failure.png
