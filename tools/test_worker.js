@@ -60,8 +60,32 @@ await waitType('quadrature');
 send({ type: 'start', cfg: cfg2, strategy: 'combined', spp: 4, passes: 3, seed: 777, recordPixel: 30 * 96 + 50 });
 const p1 = await waitType('progress');
 console.log('progress #1: passes', p1.passesDone, 'meanL', p1.meanL.toFixed(4), 'noise', (p1.noise * 100).toFixed(1) + '%', 'rgb', p1.rgb.length);
+console.log('  lobe split:', JSON.stringify(p1.lobeEnergy), 'counts', JSON.stringify(p1.lobeCounts), 'health', JSON.stringify(p1.health && p1.health.lightingImage));
 const done = await waitType('done');
 console.log('done: passes', done.passesDone);
+
+// The first run emitted several progress messages; only one was consumed. Drain
+// the rest so the next waitType('progress') cannot return a stale one.
+messages.length = 0;
+
+// Delta-lobe path through the real message pipeline: apply a material with a
+// discrete mirror lobe and confirm the worker still renders a lighting image
+// and reports the event split (the discrete lobe is only visible to the
+// material/combined strategies).
+const cfgDelta = { ...cfg2, deltaMix: 0.5, lightScale: 0.4, lightShift: 0.2 };
+send({ type: 'set-scene', cfg: cfgDelta });
+await waitType('scene-ready');
+send({ type: 'quadrature', cfg: cfgDelta, grid: 40 });
+await waitType('quadrature');
+send({ type: 'start', cfg: cfgDelta, strategy: 'combined', spp: 8, passes: 2, seed: 99, recordPixel: 32 * 96 + 56 });
+const pd = await waitType('progress');
+console.log('delta run: meanL', pd.meanL.toFixed(4), 'noise', pd.noise == null ? 'null' : (pd.noise * 100).toFixed(1) + '%',
+  'lobe', JSON.stringify(pd.lobeEnergy), 'counts', JSON.stringify(pd.lobeCounts),
+  'health', JSON.stringify(pd.health && { lightingImage: pd.health.lightingImage, deltaActive: pd.health.deltaActive, issues: pd.health.issues }));
+await waitType('done');
+if (!(pd.meanL > 0)) throw new Error('delta run produced a blank image');
+if (!pd.lobeEnergy || !pd.lobeCounts) throw new Error('delta run did not report event split');
+console.log('delta run OK');
 
 // Validate path (small RUNS/spp internally; may take a few seconds).
 send({ type: 'validate', cfg: cfg2 });

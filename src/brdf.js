@@ -2,14 +2,26 @@
 // sampled in the projected-solid-angle measure and combined with a
 // 50/50 lobe mixture. Every strategy returns {wi, weight = fr*cos/pdf, pdf}
 // where pdf is the mixture density in the same measure.
+//
+// An OPTIONAL perfect-mirror *delta* lobe can be added with `deltaMix > 0`.
+// That lobe is a discrete event: it has a selection probability, not a density,
+// and lives in the point-mass measure. The default (deltaMix = 0) reproduces the
+// original continuous-only sampler exactly, including its RNG consumption, so
+// existing scenes are unchanged.
 
 import {
   dot, normalize, orthonormalFrame, toLocal, fromLocal,
-  add, sub, mulScalar, length,
+  add, sub, mulScalar, length, reflectDirAround,
 } from './math.js';
+import { MEASURE, EVENT } from './measure.js';
 
-export function makeMaterial({ albedo, roughness, metallic = 0.0 }) {
-  return { albedo, roughness: Math.max(0.02, roughness), metallic };
+export function makeMaterial({ albedo, roughness, metallic = 0.0, deltaMix = 0.0 }) {
+  return {
+    albedo,
+    roughness: Math.max(0.02, roughness),
+    metallic,
+    deltaMix: Math.max(0, Math.min(1, deltaMix)),
+  };
 }
 
 function fresnelSchlick(cosTheta, F0) {
@@ -100,8 +112,70 @@ export function pdfBrdf(mat, n, wo, wi) {
   return 0.5 * pSpec + 0.5 * pDiff;
 }
 
-export function sampleMaterial(mat, baseColor, n, wo, rng) {
+// ---- inspectable probability interfaces ----
+//
+// The task is to keep the *discrete selection probability* (a point mass) and
+// the *continuous direction density* (a solid-angle pdf) as separate, checkable
+// things. These three helpers make that split explicit; callers must not read a
+// continuous density on behalf of a delta event, nor divide a delta by one.
+
+// Selection probability of each material event type. Sums to 1. For the
+// original continuous-only material, delta = 0 and continuous = 1.
+export function materialEventProbabilities(mat) {
+  const delta = Math.max(0, Math.min(1, mat.deltaMix || 0));
+  return { continuous: 1 - delta, delta };
+}
+
+// Continuous direction density in SOLID ANGLE (no delta). This is what a light
+// technique's density comparison may use.
+export function continuousPdfBrdf(mat, n, wo, wi) {
+  return pdfBrdf(mat, n, wo, wi);
+}
+
+// Reflectance of the discrete mirror lobe: the fraction of radiance reflected
+// into the exact mirror direction. This is a *weight*, not a density; it is the
+// value the delta event contributes (L_e · R) and must never be divided by a
+// continuous pdf.
+export function evalMirrorReflectance(mat, baseColor, n, wo) {
+  const NoV = dot(n, wo);
+  if (!(NoV > 0)) return null;
+  const F0 = f0For(baseColor, mat.metallic);
+  return fresnelSchlick(NoV, F0);
+}
+
+export function sampleMaterial(mat, baseColor, n, wo, rng, { forceEvent = null } = {}) {
   const alpha = mat.roughness * mat.roughness;
+  // An opt-in discrete mirror event. Only when deltaMix > 0 do we draw the type
+  // selector, so the default material consumes RNG exactly as before.
+  // `forceEvent` renders one lobe in isolation (for the additivity check):
+  //   'delta'      -> only the mirror lobe, with selection probability 1
+  //   'continuous' -> only the continuous lobes, with selection probability 1
+  const deltaMix = mat.deltaMix || 0;
+  // The delta lobe exists only when deltaMix > 0. Forcing 'delta' on a material
+  // that has no delta lobe must produce nothing, not a fabricated mirror event.
+  const hasDelta = deltaMix > 0;
+  const wantsDelta = hasDelta && forceEvent === 'delta';
+  const wantsContinuous = forceEvent === 'continuous';
+  const deltaProb = wantsDelta ? 1 : wantsContinuous ? 0 : deltaMix;
+  const continuousProb = wantsContinuous ? 1 : wantsDelta ? 0 : (1 - deltaMix);
+  if (deltaProb > 0 && (wantsDelta || rng.next() < deltaProb)) {
+    const wi = reflectDirAround(n, wo);
+    if (dot(n, wi) <= 0) return null;
+    const mirrorReflectance = evalMirrorReflectance(mat, baseColor, n, wo);
+    if (!mirrorReflectance) return null;
+    return {
+      wi,
+      eventType: EVENT.DELTA,
+      measure: MEASURE.POINT_MASS,
+      selectionProb: deltaProb,
+      density: 0,
+      pdf: 0,
+      weight: null,
+      mirrorReflectance,
+      sampledLobe: 'mirror-delta',
+      eval: null,
+    };
+  }
   const pickDiffuse = rng.next() < 0.5;
   const frame = orthonormalFrame(n);
   let wi;
@@ -121,11 +195,23 @@ export function sampleMaterial(mat, baseColor, n, wo, rng) {
   }
   // The actual sampling density is the 50/50 MIXTURE density, not the density
   // of the chosen lobe. Using the lobe density here would bias both the
-  // material strategy and every MIS weight built on it.
+  // material strategy and every MIS weight built on it. `selectionProb` is the
+  // probability this sampler actually used for the continuous branch, so a
+  // forced-single-lobe render (continuousProb = 1) is normalised consistently.
   const pdf = pdfBrdf(mat, n, wo, wi);
   if (!(pdf > 1e-12)) return null;
   const e = evalBrdf(mat, baseColor, n, wo, wi);
   if (!e) return null;
   const weight = e.fr.map(f => (f * e.NoL) / pdf);
-  return { wi, weight, pdf, sampledLobe: pickDiffuse ? 'diffuse' : 'ggx', eval: e };
+  return {
+    wi,
+    weight,
+    pdf,
+    eventType: EVENT.CONTINUOUS,
+    measure: MEASURE.SOLID_ANGLE,
+    selectionProb: continuousProb,
+    density: pdf,
+    sampledLobe: pickDiffuse ? 'diffuse' : 'ggx',
+    eval: e,
+  };
 }

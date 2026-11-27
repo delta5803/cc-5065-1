@@ -16,7 +16,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const PORT = Number(process.env.PORT || 8213);
 
-const puppeteer = (await import('puppeteer')).default;
+// Resolve puppeteer from the usual places: an in-repo install, or an external
+// install passed via PUPPETEER_DIR (used when the repo has no node_modules).
+let puppeteer;
+try {
+  puppeteer = (await import('puppeteer')).default;
+} catch {
+  const ext = process.env.PUPPETEER_DIR || '/tmp/uitest/node_modules/puppeteer';
+  puppeteer = (await import(path.join(ext, 'lib/puppeteer/puppeteer.js'))).default;
+}
 
 const server = spawn(process.execPath, [path.join(root, 'tools/serve.js'), String(PORT)], {
   cwd: root,
@@ -27,9 +35,11 @@ server.stderr.on('data', d => process.stderr.write(`[server!] ${d}`));
 
 await delay(600);
 
-const CHROME =
-  process.env.CHROME_PATH ||
-  '/tmp/chrome-arm/chrome-linux-arm64/chrome';
+// CHROME_PATH wins; otherwise ask puppeteer where it installed Chrome.
+const CHROME = process.env.CHROME_PATH ||
+  (typeof puppeteer.executablePath === 'function'
+    ? await puppeteer.executablePath()
+    : '/tmp/chrome-arm/chrome-linux-arm64/chrome');
 
 const browser = await puppeteer.launch({
   headless: 'new',
@@ -50,6 +60,17 @@ let failed = false;
 function check(cond, label) {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}`);
   if (!cond) failed = true;
+}
+
+// Wait until the worker has fully finished the previous run: the UI keeps Start
+// disabled until the worker posts 'done' after a cancel, so this guarantees the
+// next Start click will not be dropped by the worker's running guard.
+async function waitIdle(page, timeout = 60000) {
+  await page.waitForFunction(() => {
+    const s = document.querySelector('#start');
+    const t = document.querySelector('#stop');
+    return s && !s.disabled && t && t.disabled;
+  }, { timeout });
 }
 
 try {
@@ -102,7 +123,7 @@ try {
 
   // Stop.
   await page.click('#stop');
-  await delay(200);
+  await waitIdle(page);
 
   // Move the bright-zone boundary to force a discard, then shrink to force a
   // reweight. Watch the decision panel change mode.
@@ -147,6 +168,7 @@ try {
     return badge && /\d/.test(badge.textContent);
   }, { timeout: 60000 });
   await page.click('#stop');
+  await waitIdle(page);
   check(true, 'material-only strategy runs');
 
   // Audit + validate buttons produce text without console errors.
@@ -172,7 +194,106 @@ try {
     return badge && /\d/.test(badge.textContent);
   }, { timeout: 60000 });
   await page.click('#stop');
+  await waitIdle(page);
   check(true, 're-ran with a larger light board');
+
+  // ---- Discrete mirror lobe through the real UI ----
+  // Small light + grazing angle, deltaMix = 0.5: the event-split panel must show
+  // that the same shading point carries BOTH a continuous density and a discrete
+  // (point-mass) event, and run-health must report a lighting image + measured
+  // noise. This drives the refactored probability interface via the browser.
+  await page.evaluate(() => {
+    const set = (id, v) => {
+      const el = document.querySelector(id);
+      el.value = String(v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    set('#light-scale', 0.4);
+    set('#light-shift', 0.2);
+    set('#sphere-delta', 0.5);
+  });
+  await page.click('#apply-scene');
+  await delay(800);
+  await page.click('[data-strategy="combined"]');
+  await page.evaluate(() => {
+    const spp = document.querySelector('#spp');
+    spp.value = '8';
+    spp.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.waitForFunction(() => !document.querySelector('#start').disabled, { timeout: 15000 });
+  await page.click('#start');
+  await page.waitForFunction(() => document.querySelector('#start').disabled, { timeout: 10000 });
+  console.log('   delta run started (start button engaged)');
+  await page.waitForFunction(() => {
+    const h = document.querySelector('#health-out');
+    const l = document.querySelector('#lobe-out');
+    return h && /noise measured:\s*yes/i.test(h.textContent) &&
+           l && /discrete/i.test(l.textContent);
+  }, { timeout: 90000 });
+  const split = await page.evaluate(() => ({
+    lobe: document.querySelector('#lobe-out').textContent,
+    health: document.querySelector('#health-out').textContent,
+    noise: document.querySelector('#m-noise').textContent,
+    mean: document.querySelector('#m-mean').textContent,
+  }));
+  console.log('   event split:', split.lobe.replace(/\s+/g, ' ').trim());
+  console.log('   run health :', split.health.replace(/\s+/g, ' ').trim());
+  const contM = split.lobe.match(/continuous energy\s*([-\d.eE]+)/);
+  const deltaM = split.lobe.match(/discrete.*?energy\s*([-\d.eE]+)/);
+  const contE = contM ? parseFloat(contM[1]) : NaN;
+  const deltaE = deltaM ? parseFloat(deltaM[1]) : NaN;
+  check(Number.isFinite(contE) && contE > 0, `continuous density carries energy (${contE})`);
+  check(Number.isFinite(deltaE) && deltaE > 0, `discrete point-mass event carries energy (${deltaE})`);
+  check(/discrete lobe active/i.test(split.health), 'run-health reports the discrete lobe active');
+  check(/lighting image:\s*yes/i.test(split.health), 'run-health reports a lighting image');
+  check(/noise measured:\s*yes/i.test(split.health), 'run-health reports measured noise');
+  check(parseFloat(split.noise) > 0, `relative noise is a positive percentage (${split.noise})`);
+  check(!/⚠/.test(split.health), 'run-health flags no anomalies for the delta scene');
+  await page.click('#stop');
+  await waitIdle(page);
+
+  // ---- Moving the area light changes image AND noise ----
+  const imageSignature = () => page.evaluate(() => {
+    const c = document.querySelector('#view-image');
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    let s = 0;
+    for (let i = 0; i < d.length; i += 97) s += d[i] * ((i % 251) + 1);
+    return s;
+  });
+  const sigMovedA = await imageSignature();
+  const meanMovedA = await page.evaluate(() => document.querySelector('#m-mean').textContent);
+
+  await page.evaluate(() => {
+    const el = document.querySelector('#light-shift');
+    el.value = '-0.4';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.click('#apply-scene');
+  await delay(800);
+  await page.waitForFunction(() => !document.querySelector('#start').disabled, { timeout: 15000 });
+  await page.click('#start');
+  // Wait until the canvas shows the moved-light image AND the new run has
+  // emitted at least two passes (noise is measured from independent passes).
+  // Pass 1 resets #m-noise to '—' when it redraws the image, so a positive '%'
+  // here can only come from this run, not the previous one.
+  await page.waitForFunction((prev) => {
+    const c = document.querySelector('#view-image');
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    let s = 0;
+    for (let i = 0; i < d.length; i += 97) s += d[i] * ((i % 251) + 1);
+    const m = document.querySelector('#m-noise');
+    return s !== prev && m && /^\d+(\.\d+)?%$/.test(m.textContent);
+  }, { timeout: 90000 }, sigMovedA);
+  const sigMovedB = await imageSignature();
+  const noiseMoved = await page.evaluate(() => document.querySelector('#m-noise').textContent);
+  const meanMovedB = await page.evaluate(() => document.querySelector('#m-mean').textContent);
+  await page.click('#stop');
+  await waitIdle(page);
+  console.log(`   moved light: mean ${meanMovedA} -> ${meanMovedB}, noise ${split.noise} -> ${noiseMoved}`);
+  check(sigMovedA > 0 && sigMovedB > 0, 'both lighting images are non-blank after moving the light');
+  check(sigMovedA !== sigMovedB, 'moving the area light changes the rendered image');
+  check(/^\d+(\.\d+)?%$/.test(noiseMoved) && parseFloat(noiseMoved) > 0,
+    'moving the light still reports measured noise');
 
   const finalErrors = consoleErrors.filter(e => !/favicon/i.test(e));
   check(finalErrors.length === 0, `no console errors (${finalErrors.length})`);

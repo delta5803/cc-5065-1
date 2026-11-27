@@ -16,13 +16,24 @@
 // is always resolved against the CURRENT exposure, never a retained table.
 
 import {
-  add, dot, length, mulScalar, normalize, sub,
+  add, dot, length, mulScalar, normalize, sub, reflectDirAround,
 } from './math.js';
 import {
   trace, hitNormal, surfaceMaterial, inRect, subtractRects, planePoint, planeUV,
 } from './scene.js';
-import { pdfBrdf, sampleMaterial, evalBrdf } from './brdf.js';
+import {
+  pdfBrdf, sampleMaterial, evalBrdf, evalMirrorReflectance,
+} from './brdf.js';
+import {
+  pdfOmegaToArea, pdfAreaToOmega, jacobianCosOverDist2, MEASURE, EVENT,
+} from './measure.js';
+import {
+  materialContinuousEvent, materialDeltaEvent, misCombine,
+} from './probability.js';
 import { streamSeed, Rng } from './rng.js';
+
+// Re-export the measure helpers for existing callers (tests, debug tools).
+export { pdfOmegaToArea, pdfAreaToOmega, jacobianCosOverDist2 } from './measure.js';
 
 const ZERO = [0, 0, 0];
 const BG = [0.0008, 0.0009, 0.0012];
@@ -31,22 +42,6 @@ const v3add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 const v3scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
 const v3mul = (a, b) => [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
 const lum = (c) => (c[0] + c[1] + c[2]) / 3;
-
-// ---- explicit measure conversion ----
-
-// Solid angle pdf -> area pdf on the emitter.
-export function pdfOmegaToArea(pdfOmega, cosY, dist2) {
-  if (!(dist2 > 0) || !(cosY > 0) || !(pdfOmega > 0)) return 0;
-  return (pdfOmega * cosY) / dist2;
-}
-// Area pdf -> solid angle pdf (the Jacobian is dist²/cosY).
-export function pdfAreaToOmega(pdfArea, cosY, dist2) {
-  if (!(dist2 > 0) || !(cosY > 0) || !(pdfArea > 0)) return 0;
-  return (pdfArea * dist2) / cosY;
-}
-export function jacobianCosOverDist2(cosY, dist2) {
-  return dist2 > 0 && cosY > 0 ? cosY / dist2 : 0;
-}
 
 // ---- region partition (diagnostics) ----
 
@@ -117,9 +112,16 @@ function emitterVisible(scene, x, y, board) {
 }
 
 // A contribution record carries everything needed to audit a sampled path.
+// The event type and measure are first-class: a consumer must consult them
+// before treating `weight` as a density ratio or dividing by a density.
 function makeRecord(technique, extra) {
   return {
     technique,
+    eventType: EVENT.CONTINUOUS,
+    measure: MEASURE.AREA,
+    selectionProb: 1,
+    comparable: false,
+    combineReason: '',
     y: null, uv: null,
     pL_area: 0, pM_area: 0, pOmega: 0,
     dist: 0, cosX: 0, cosY: 0, G: 0, jacobian: 0,
@@ -129,11 +131,22 @@ function makeRecord(technique, extra) {
   };
 }
 
-// Light-strategy sample at shading point sh.
-export function lightSample(exposure, sh, rng, { mis = true } = {}) {
-  const { scene, board, zone, proposal, albedo } = exposure;
+// ---- phase 1: direction sampling ----
+//
+// Each phase is a separate, inspectable step. The sampling phase draws a
+// direction and fills the *geometry* of the record; it does not decide a weight.
+// The density phase evaluates the competing strategy's density; the
+// contribution phase combines the two. Keeping them apart is what stops a
+// density conversion error from being hidden inside a fixed weight.
+
+export function sampleLightDirection(exposure, sh, rng) {
+  const { scene, board, proposal } = exposure;
   const s = proposal.sample(rng);
-  const rec = makeRecord('light', { y: s.p, uv: s.uv, pL_area: s.pdfArea });
+  const rec = makeRecord('light', {
+    y: s.p, uv: s.uv,
+    pL_area: s.pdfArea,
+    eventType: EVENT.CONTINUOUS, measure: MEASURE.AREA, selectionProb: 1,
+  });
   const d = sub(s.p, sh.p);
   const dist2 = dot(d, d);
   if (!(dist2 > 1e-18)) { rec.reason = 'degenerate distance'; return rec; }
@@ -141,7 +154,9 @@ export function lightSample(exposure, sh, rng, { mis = true } = {}) {
   const wi = mulScalar(d, 1 / dist);
   const cosX = dot(sh.n, wi);
   if (!(cosX > 0)) { rec.reason = 'shading cosine <= 0'; return rec; }
+  rec.wi = wi;
   rec.dist = dist;
+  rec.dist2 = dist2;
   rec.cosX = cosX;
   rec.cosY = emitterCos(board, wi);
   rec.jacobian = jacobianCosOverDist2(rec.cosY, dist2);
@@ -154,30 +169,23 @@ export function lightSample(exposure, sh, rng, { mis = true } = {}) {
   if (!e) { rec.reason = 'brdf rejected direction'; return rec; }
   rec.fr = e.fr;
   rec.G = (cosX * rec.cosY) / dist2;
-  rec.f = v3scale(v3mul(albedo, e.fr), rec.G);
-  const pOmega = pdfBrdf(sh.material, sh.n, sh.wo, wi);
-  rec.pOmega = pOmega;
-  rec.pM_area = pdfOmegaToArea(pOmega, rec.cosY, dist2);
-  let w = 1;
-  if (mis) {
-    const denom = rec.pL_area + rec.pM_area;
-    w = denom > 0 ? rec.pL_area / denom : 1;
-    if (!(rec.pM_area > 0)) rec.reason = 'material pdf = 0 -> full weight';
-  }
-  rec.weight = w;
-  rec.contribution = v3scale(rec.f, w / rec.pL_area);
+  rec.f = v3scale(v3mul(exposure.albedo, e.fr), rec.G);
   rec.region = overlapRegionOf(em.uv, exposure.regions);
   return rec;
 }
 
-// Material-strategy sample at shading point sh.
-export function materialSample(exposure, sh, rng, { mis = true } = {}) {
-  const { scene, board, zone, proposal, albedo } = exposure;
+export function sampleMaterialDirection(exposure, sh, rng, { forceEvent = null } = {}) {
+  const { scene, board } = exposure;
   const rec = makeRecord('material', { visible: true });
-  const smp = sampleMaterial(sh.material, sh.base, sh.n, sh.wo, rng);
+  const smp = sampleMaterial(sh.material, sh.base, sh.n, sh.wo, rng, { forceEvent });
   if (!smp) { rec.reason = 'material sample failed'; rec.visible = false; return rec; }
   rec.lobe = smp.sampledLobe;
-  rec.pOmega = smp.pdf;
+  rec.eventType = smp.eventType;
+  rec.measure = smp.measure;
+  rec.selectionProb = smp.selectionProb;
+  rec.pOmega = smp.density || 0;
+  rec.wi = smp.wi;
+  if (smp.eventType === EVENT.DELTA) rec.mirrorReflectance = smp.mirrorReflectance;
   const origin = add(sh.p, mulScalar(sh.n, 1e-4));
   const hit = trace(scene, origin, smp.wi, 1e-5);
   if (!hit) { rec.reason = 'escaped'; rec.visible = false; return rec; }
@@ -191,31 +199,129 @@ export function materialSample(exposure, sh, rng, { mis = true } = {}) {
   if (!(dist2 > 1e-18)) { rec.reason = 'degenerate distance'; return rec; }
   const dist = Math.sqrt(dist2);
   rec.dist = dist;
+  rec.dist2 = dist2;
   rec.cosX = dot(sh.n, smp.wi);
   rec.cosY = emitterCos(board, smp.wi);
   rec.jacobian = jacobianCosOverDist2(rec.cosY, dist2);
-  const em = currentEmission(exposure, y);
   rec.region = uv ? overlapRegionOf(uv, exposure.regions) : 'none';
+  const em = currentEmission(exposure, y);
   if (!em) { rec.reason = 'hit masked/out-of-zone point (this exposure)'; return rec; }
-  if (!(rec.cosX > 0) || !(rec.cosY > 0)) { rec.reason = 'cosine <= 0'; return rec; }
   rec.emission = em.emission;
+  if (smp.eventType === EVENT.DELTA) {
+    // A delta (perfect-mirror) event reflects radiance to radiance: the delta
+    // lobe's reflectance R already contains the ∫fr·cosθ dω = R normalisation,
+    // so the contribution is L_e·R with NO extra cosine. The estimator divides
+    // only by the discrete SELECTION probability q, never by a density.
+    rec.f = v3mul(exposure.albedo, smp.mirrorReflectance);
+    return rec;
+  }
+  if (!(rec.cosX > 0) || !(rec.cosY > 0)) { rec.reason = 'cosine <= 0'; return rec; }
   rec.fr = smp.eval.fr;
   rec.G = (rec.cosX * rec.cosY) / dist2;
-  rec.f = v3scale(v3mul(albedo, smp.eval.fr), rec.G);
-  // Material density converted to the common area measure.
-  rec.pM_area = pdfOmegaToArea(smp.pdf, rec.cosY, dist2);
-  if (!(rec.pM_area > 0)) { rec.reason = 'area pdf = 0'; return rec; }
-  // Light density MUST come from this exposure's proposal, not from history.
-  rec.pL_area = proposal.pdfAreaAt(uv);
-  let w = 1;
-  if (mis) {
-    const denom = rec.pL_area + rec.pM_area;
-    w = denom > 0 ? rec.pM_area / denom : 1;
-    if (!(rec.pL_area > 0)) rec.reason = 'light pdf = 0 -> full weight';
-  }
-  rec.weight = w;
-  rec.contribution = v3scale(rec.f, w / rec.pM_area);
+  rec.f = v3scale(v3mul(exposure.albedo, smp.eval.fr), rec.G);
   return rec;
+}
+
+// ---- phase 2 + 3: density and contribution ----
+//
+// `misCombine` is the multi-strategy combiner. It is given the event the
+// strategy actually sampled and the competing strategy's event at the SAME
+// direction, both expressed in the common AREA measure. It returns the balance
+// weight *and* whether the two were comparable as densities, so a point-mass
+// branch can never be divided by an ordinary density.
+
+export function assessLightContribution(rec, sh, mis) {
+  if (rec.reason) return rec;
+  // Competing material density at this direction, in the common area measure.
+  const cont = materialContinuousEvent(sh, rec.wi, rec.cosY, rec.dist2);
+  rec.pOmega = cont.pdfOmega;
+  rec.pM_area = cont.density;
+  const own = { eventType: rec.eventType, measure: rec.measure, density: rec.pL_area };
+  const other = { eventType: cont.eventType, measure: cont.measure, density: rec.pM_area };
+  const combo = mis ? misCombine(own, other) : { weight: 1, comparable: false, reason: '' };
+  rec.weight = combo.weight;
+  rec.comparable = combo.comparable;
+  rec.combineReason = combo.reason;
+  if (mis && !(rec.pM_area > 0)) rec.reason = 'material pdf = 0 -> full weight';
+  rec.contribution = v3scale(rec.f, rec.weight / rec.pL_area);
+  return rec;
+}
+
+export function assessMaterialContribution(rec, sh, exposure, mis) {
+  if (rec.reason) return rec;
+  if (rec.eventType === EVENT.DELTA) {
+    // Point-mass branch: divide only by the discrete SELECTION probability,
+    // never by a continuous density. The light strategy assigns a delta zero
+    // probability, so MIS gives it full weight.
+    const own = { eventType: rec.eventType, measure: rec.measure, selectionProb: rec.selectionProb };
+    const combo = mis ? misCombine(own, null) : { weight: 1, comparable: false, reason: '' };
+    rec.weight = combo.weight;
+    rec.comparable = false;
+    rec.combineReason = combo.reason;
+    const q = rec.selectionProb > 0 ? rec.selectionProb : 1;
+    rec.contribution = v3scale(rec.f, rec.weight / q);
+    return rec;
+  }
+  // Continuous branch: convert the solid-angle density to area once, then let
+  // the combiner compare it with the light density in that same measure. The
+  // density uses the selection probability ACTUALLY used by the sampler (1 for a
+  // forced-single-lobe render, 1-deltaMix otherwise), so the two lobes are
+  // normalised consistently whether rendered together or separately.
+  const cont = materialContinuousEvent(sh, rec.wi, rec.cosY, rec.dist2, rec.pOmega, rec.selectionProb);
+  rec.pM_area = cont.density;
+  if (!(rec.pM_area > 0)) { rec.reason = 'area pdf = 0'; return rec; }
+  // The competing light density MUST come from THIS exposure's proposal, not
+  // from a retained history table.
+  rec.pL_area = exposure.proposal.pdfAreaAt(rec.uv);
+  // `own` describes the density actually used for the ratio: the material's
+  // solid-angle density converted to the common AREA measure (rec.measure on
+  // the record still says where it was sampled, which is what the inspector
+  // shows; the comparison is explicitly in area).
+  const own = { eventType: EVENT.CONTINUOUS, measure: MEASURE.AREA, density: rec.pM_area };
+  const other = { eventType: EVENT.CONTINUOUS, measure: MEASURE.AREA, density: rec.pL_area };
+  const combo = mis ? misCombine(own, other) : { weight: 1, comparable: false, reason: '' };
+  rec.weight = combo.weight;
+  rec.comparable = combo.comparable;
+  rec.combineReason = combo.reason;
+  if (mis && !(rec.pL_area > 0)) rec.reason = 'light pdf = 0 -> full weight';
+  rec.contribution = v3scale(rec.f, rec.weight / rec.pM_area);
+  return rec;
+}
+
+// Compatibility adapters: the original single-call entry points, kept so the
+// multi-strategy lighting callers (tests, debug tools, worker) keep working.
+// They run the three phases in order and return the same record shape.
+export function lightSample(exposure, sh, rng, { mis = true } = {}) {
+  const rec = sampleLightDirection(exposure, sh, rng);
+  return assessLightContribution(rec, sh, mis);
+}
+
+export function materialSample(exposure, sh, rng, { mis = true, forceEvent = null } = {}) {
+  const rec = sampleMaterialDirection(exposure, sh, rng, { forceEvent });
+  return assessMaterialContribution(rec, sh, exposure, mis);
+}
+
+// Deterministic evaluation of the discrete mirror lobe at a shading point,
+// matching what materialSample would produce when it selects a delta event
+// (with q = deltaMix, w = 1 from the combiner). Returns null when the material
+// has no delta lobe or the reflected direction misses the current zone.
+export function mirrorDeltaContribution(exposure, sh) {
+  const dm = sh.material && sh.material.deltaMix ? sh.material.deltaMix : 0;
+  if (!(dm > 0)) return null;
+  const { scene, board } = exposure;
+  const wi = reflectDirAround(sh.n, sh.wo);
+  if (!(dot(sh.n, wi) > 0)) return null;
+  const origin = add(sh.p, mulScalar(sh.n, 1e-4));
+  const hit = trace(scene, origin, wi, 1e-5);
+  if (!hit || hit.obj !== board) return null;
+  const y = hit.p;
+  const em = currentEmission(exposure, y);
+  if (!em) return null;
+  const R = evalMirrorReflectance(sh.material, sh.base, sh.n, sh.wo);
+  if (!R) return null;
+  const contribution = v3mul(exposure.albedo, R);
+  const uv = planeUV(board, y);
+  return { contribution, y, uv, region: overlapRegionOf(uv, exposure.regions) };
 }
 
 // ---- image rendering ----
@@ -236,7 +342,7 @@ function now() {
 
 export function renderImage({
   exposure, cam, spp, seed, strategy = 'combined', recordPixel = -1, recordLimit = 40,
-  rowFactory = null,
+  rowFactory = null, forceEvent = null,
 }) {
   const { scene } = exposure;
   const { width, height } = cam;
@@ -249,6 +355,13 @@ export function renderImage({
     occluded: 0, maskedHits: 0, escaped: 0,
   };
   const records = [];
+  // Per-event-type energy accounting. The material strategy has two event
+  // types that must stay separately checkable: a CONTINUOUS density and a
+  // discrete DELTA (point mass). Their sums, normalised by their own sample
+  // counts, add to the material estimate; a separate render of each lobe must
+  // reproduce this split.
+  const lobeEnergy = { continuous: [0, 0, 0], delta: [0, 0, 0] };
+  const counts = { continuous: 0, delta: 0 };
   const nLight = strategy === 'light' ? spp : strategy === 'material' ? 0 : Math.ceil(spp / 2);
   const nMat = spp - nLight;
   const t0 = now();
@@ -287,7 +400,7 @@ export function renderImage({
           }
         }
         for (let i = 0; i < nMat; i++) {
-          const rec = materialSample(exposure, sh, rng, { mis: strategy === 'combined' });
+          const rec = materialSample(exposure, sh, rng, { mis: strategy === 'combined', forceEvent });
           stats.materialSamples++;
           if (rec.reason.includes('light pdf = 0')) stats.materialZeroPdf++;
           if (rec.reason === 'escaped') stats.escaped++;
@@ -297,6 +410,9 @@ export function renderImage({
             stats.materialNonzero++;
             add3(accM, rec.contribution);
             addRegion(regionEnergy, rec.region, rec.contribution, nMat);
+            const key = rec.eventType === EVENT.DELTA ? 'delta' : 'continuous';
+            addRegion(lobeEnergy, key, rec.contribution, nMat);
+            counts[key]++;
           }
         }
         if (pix === recordPixel) {
@@ -314,7 +430,7 @@ export function renderImage({
     }
     if (rowFactory) rowFactory(py + 1, height);
   }
-  return { rgb, width, height, regionEnergy, stats, records, ms: now() - t0, spp, strategy, seed };
+  return { rgb, width, height, regionEnergy, lobeEnergy, counts, stats, records, ms: now() - t0, spp, strategy, seed };
 }
 
 function add3(a, b) { a[0] += b[0]; a[1] += b[1]; a[2] += b[2]; }
@@ -364,6 +480,16 @@ export function quadrature({ exposure, cam, grid = 32, pixels = null }) {
     } else {
       const sh = makeShading(scene, hit, ray.d);
       const acc = [0, 0, 0];
+      // Discrete (delta) lobe: evaluated exactly, not by quadrature. The mirror
+      // collapses the directional integral to a single direction, so its
+      // contribution is L_e · R at that direction. Added only when the material
+      // actually has a delta lobe (deltaMix > 0), which keeps the default scene
+      // reference byte-identical to the continuous-only one.
+      const dlt = mirrorDeltaContribution(exposure, sh);
+      if (dlt) {
+        add3(acc, dlt.contribution);
+        add3(regionEnergy[regionEnergy[dlt.region] ? dlt.region : 'bright'], dlt.contribution);
+      }
       for (let j = 0; j < grid; j++) {
         for (let i = 0; i < grid; i++) {
           const u = (i + 0.5) / grid;

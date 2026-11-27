@@ -64,6 +64,12 @@
         </div>
       </div>
       <div class="row">
+        <label for="sphere-delta">Discrete mirror lobe</label>
+        <input id="sphere-delta" type="range" min="0" max="1" step="0.05" value="0" />
+        <output id="sphere-delta-out">0.00</output>
+      </div>
+      <p class="hint">Raising the discrete mirror lobe gives the <em>same direction</em> both a continuous diffuse/GGX density and a discrete reflection. The discrete event has a selection probability, not a density; the combiner never divides it by one. Use a small light + grazing angle to see it fire.</p>
+      <div class="row">
         <button id="apply-scene">Apply scene changes</button>
       </div>
     </div>
@@ -140,6 +146,11 @@
         <thead><tr><th>region</th><th>quadrature</th><th>sampler</th><th>Δ</th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+    <div class="group">
+      <h2>Event split / run health</h2>
+      <div id="lobe-out" class="decision">Run sampling to see continuous vs discrete energy.</div>
+      <div id="health-out" class="hint" style="margin-top:8px">—</div>
     </div>
     <div class="group">
       <h2>Selected light path</h2>

@@ -32,6 +32,37 @@ Zero densities are handled explicitly: if the other technique's density is
 zero, the first receives full weight. Emission is always resolved against the
 **current** exposure's bright zone, never a retained table.
 
+## Sampling-probability interface
+
+Direction sampling, probability density, and contribution assessment are
+separate modules, joined by an explicit sampling record:
+
+| Module | Responsibility |
+| --- | --- |
+| `src/measure.js` | The measure/event vocabulary: `AREA`, `SOLID_ANGLE`, `POINT_MASS`; `CONTINUOUS`, `DELTA`; `pdfOmegaToArea` / `pdfAreaToOmega` / `jacobianCosOverDist2`; `comparableByDensity`. One place defines what a measure is. |
+| `src/probability.js` | The inspectable probability interface. A sampler hands back `{ measure, eventType, selectionProb, density }`; `misCombine` decides comparability and returns `{ weight, comparable, reason }`. |
+| `src/brdf.js` | `materialEventProbabilities`, `sampleMaterial(..., { forceEvent })` — returns either a `CONTINUOUS` event (density in `SOLID_ANGLE`) or a `DELTA` event (`POINT_MASS`, density 0, selection probability only). |
+| `src/integrator.js` | `sampleLightDirection` / `sampleMaterialDirection` (phase 1), then `assessLightContribution` / `assessMaterialContribution` (phases 2+3), then combine. |
+
+The **discrete mirror lobe** (`deltaMix ∈ [0,1]`) gives the same shading point
+both a *continuous diffuse/GGX density* and a *discrete (point-mass) reflection
+event*. This is the case the interface exists for:
+
+* A **continuous** event has a real density, is converted between measures with
+  the Jacobian, and is divided by its density (times its selection probability)
+  in the estimator.
+* A **delta** event has **no density**. It carries a **selection probability**
+  `q` and is divided by `q` only — **never** by a continuous density and never
+  Jacobian-converted. `misCombine` returns full weight for a delta (it is not
+  comparable to a continuous density) and `test_probability.js` checks that
+  dividing a point mass by a continuous density, or applying the Jacobian to it,
+  is biased.
+
+Weights are computed from those explicit inputs; nothing is hidden behind a
+fixed constant. The refactor is a **boundary on external behaviour**: for the
+default `deltaMix = 0` scene the multi-strategy estimate is bit-identical to the
+pre-refactor kernel (`tools/test_freeze.js` checks this against golden sums).
+
 ## What the code delivers
 
 | Concern | Where | How |
@@ -43,11 +74,15 @@ zero, the first receives full weight. Emission is always resolved against the
 | Never use a table that gives zero probability to new bright area | `src/exposure.js`, `src/lighttable.js` | `tableCoversZone`, `zoneCoveredBy`, `reweightTable` |
 | Per-region energy vs per-region quadrature | `src/integrator.js` `buildRegions`, `quadrature`; UI table | split by overlap with retained zones; full total *and* each region shown |
 | Same integration domain across measures | `src/integrator.js` `auditMeasures` | both techniques vs deterministic quadrature over the current zone |
-| Area↔solid-angle Jacobian, visibility, zero pdf | `src/integrator.js` (`pdfOmegaToArea`, `pdfAreaToOmega`), `tools/test_jacobian.js` | explicit conversion + exact round-trip test |
+| Area↔solid-angle Jacobian, visibility, zero pdf | `src/measure.js` (`pdfOmegaToArea`, `pdfAreaToOmega`), `tools/test_jacobian.js` | explicit conversion + exact round-trip test |
+| Separate sampling / density / contribution | `src/integrator.js` `sampleLightDirection`, `sampleMaterialDirection`, `assessLightContribution`, `assessMaterialContribution` | phase 1 samples, phases 2+3 assess; the record carries `eventType`, `measure`, `selectionProb` |
+| Inspectable selection probability vs direction density | `src/probability.js` `materialContinuousEvent`, `materialDeltaEvent`, `misCombine` | one interface; a delta is divided by selection probability only, never by a density |
+| Simultaneous discrete + continuous reflection | `src/brdf.js` (`deltaMix`), `src/integrator.js` | mirror delta event and diffuse/GGX density at the same direction; separate renderings and combined estimate agree (`tools/test_probability.js`) |
 | Not "average two images and call it done" | `src/integrator.js` | each technique normalised by its **own** sample count; MIS shares sum |
 | Fixed seed sequence + high-sample reference | `src/rng.js` (sfc32), `tools/validate.js`, UI "reference overlay" | per-pixel deterministic streams; quadrature reference |
 | Inspect a chosen light path's weight | UI "Selected light path" panel; record is emitted per probe pixel | shows `w`, `p_L`, `p_ω`, `p_M(area)`, `cosθ_y`, `dist`, contribution, reason |
-| Vary light size and roughness | UI "Light board" + sphere roughness/metallic sliders | rebuilds geometry |
+| Vary light size, position and roughness | UI "Light board" + sphere sliders | rebuilds geometry |
+| Visible run state + anomaly flags | UI "Event split / run health" panel; `ui/worker.js` `assessRunHealth` | lighting-image yes/no, noise measured, continuous vs discrete energy; warns on blank/non-finite image or a delta lobe that never reaches the emitter |
 | Compare single vs combined strategy mean/variance/cost | UI "Run unbiasedness check"; `tools/validate.js` | several independent seeds, bias %, sd, RMSE, ms |
 | UI launches and shows image + noise | `ui/index.html` | see below |
 
@@ -81,22 +116,35 @@ server maps `/` to it. The page loads ES modules from `src/` and
    `discard-history`, `add-covering-component`) and the coverage of each
    proposal component.
 4. **Light board** sliders change light size and position; sphere sliders change
-   roughness/metallic. **Apply scene changes** rebuilds geometry (history
-   resets, because a different board has a different parameterisation).
-5. **Show reference overlay** paints the per-pixel relative error against the
+   roughness/metallic/`deltaMix`. **Apply scene changes** rebuilds geometry
+   (history resets, because a different board has a different parameterisation).
+5. **Discrete mirror lobe** slider (`deltaMix`, 0–1) gives the sphere a
+   point-mass reflection in addition to its continuous diffuse/GGX density. At
+   `deltaMix > 0` the same shading point has both a continuous and a discrete
+   event; the **Event split / run health** panel shows the energy each carries.
+6. **Show reference overlay** paints the per-pixel relative error against the
    deterministic quadrature reference (blue = agree, red = disagree).
-6. **Measure audit** runs both techniques against the quadrature over the same
+7. **Measure audit** runs both techniques against the quadrature over the same
    zone and reports each one's distance from the reference as a **z-score over
    12 pooled independent seeds** (raw % shown too). A large raw % with a small
    z is variance, not bias; the panel says which.
-7. **Run unbiasedness check** runs 16 independent seeds at a 96×64 validation
+8. **Run unbiasedness check** runs 16 independent seeds at a 96×64 validation
    camera for all three strategies at two sample counts and prints bias, z
    (with the reference's own convergence error folded in) and RMSE. All rows
    within 3σ means consistent with unbiased at that sample count.
-8. **Selected light path** — move the probe pixel sliders; the first recorded
-   light and material samples at that pixel are listed with their MIS weight and
-   density conversion, including why a sample was rejected (masked, occluded,
-   zero pdf, …).
+9. **Selected light path** — move the probe pixel sliders; the first recorded
+   light and material samples at that pixel are listed with their MIS weight,
+   `eventType`, `measure`, `selectionProb` and density conversion, including why
+   a sample was rejected (masked, occluded, zero pdf, …).
+10. **Event split / run health** — shows run state and flags anomalies: whether a
+    lighting image was produced, whether noise was measured, continuous vs
+    discrete (point-mass) energy and hit counts, and warnings for a blank or
+    non-finite image, or a delta lobe that never reaches the emitter.
+
+**The command line only aids multi-strategy lighting.** The interactive
+multi-strategy lighting window is the graphical entry point — `node tools/serve.js`
+then open `http://localhost:8080/` (see *Launch the window* above). The Node
+scripts below are supporting evidence, not a substitute for the window.
 
 ## Headless verification
 
@@ -106,9 +154,13 @@ The same kernel runs in Node. These scripts are the evidence, not the UI:
 node tools/validate.js        # reference, convergence, per-region, exposure transition
 node tools/test_brdf.js       # BRDF sampler vs deterministic hemisphere integral
 node tools/test_jacobian.js   # area<->solid-angle Jacobian round-trip + mass
+node tools/test_freeze.js     # default-scene estimate bit-identical to pre-refactor kernel
+node tools/test_probability.js # selection prob vs density split; discrete+continuous agreement
+node tools/run_clean.js       # reruns the above in a pristine temp dir (no data files)
 node tools/test_audit_bias.js # both techniques vs quadrature, mean ± se
 node tools/test_policy.js     # grow/shrink/disjoint exposure sequences vs quadrature
 node tools/test_worker.js     # exact UI worker message path in Node
+node tools/browser_test.js    # real headless Chrome: drives the window end to end
 ```
 
 `tools/validate.js` prints, for each strategy and sample count, the mean over
@@ -131,20 +183,22 @@ src/
   math.js        vectors, frames, reflection
   rng.js         sfc32 streams, per-pixel deterministic seeding
   scene.js       plane/sphere geometry, emission/mask control map, trace/visibility
-  brdf.js        Lambertian + GGX mixture, eval/sample/pdf in solid angle
+  measure.js     measure/event vocabulary, area<->solid-angle Jacobian
+  probability.js sampling-probability interface: events, selection prob, MIS combine
+  brdf.js        Lambertian + GGX mixture (+ optional mirror delta), eval/sample/pdf
   lighttable.js  weighted rect-union tables, coverage, reweighting, proposal mixture
   exposure.js    exposure history controller and decision log
-  integrator.js  L and M techniques, MIS, measure conversion, regions, quadrature, audit
+  integrator.js  phase-1 samplers, phase-2/3 assessors, MIS, regions, quadrature, audit
   display.js     tonemap and per-pixel error image
   setup.js       default scene/camera/exposures
 ui/
-  index.html     experiment window
+  index.html     experiment window (event split / run health, discrete lobe slider)
   styles.css
   app.js         UI controller (all numbers/images come from the worker)
-  worker.js      runs the kernel off the main thread
+  worker.js      runs the kernel off the main thread; reports lobe split + run health
 tools/
   serve.js       zero-dependency static server
-  validate.js, test_*.js, debug_*.js
+  validate.js, test_*.js, debug_*.js, run_clean.js, browser_test.js
 ```
 
 ## Notes on honesty of the results

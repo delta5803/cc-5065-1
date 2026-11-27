@@ -26,6 +26,7 @@ const state = {
     lightShift: 0,
     roughness: 0.18,
     metallic: 0.85,
+    deltaMix: 0,
     zone: { u0: 0.12, u1: 0.62, v0: 0.10, v1: 0.92 },
   },
   running: false,
@@ -63,6 +64,7 @@ function cfgSnapshot() {
     lightShift: state.cfg.lightShift,
     roughness: state.cfg.roughness,
     metallic: state.cfg.metallic,
+    deltaMix: state.cfg.deltaMix,
     width: W,
     height: H,
   };
@@ -105,7 +107,11 @@ function onWorker(ev) {
     case 'error':
       setEngineStatus('Engine error', 'bad');
       renderError(msg.message);
-      stopRun();
+      // An error can abort a run without the worker posting 'done'; recover the
+      // controls directly so Start is not left disabled forever.
+      send({ type: 'stop' });
+      state.running = false;
+      setRunningUI(false);
       break;
     default:
       break;
@@ -136,8 +142,39 @@ function renderProgress(msg) {
   $('#m-spp').textContent = String(msg.passesDone * msg.spp);
   $('#progress-bar').style.width = `${(msg.passesDone / msg.passesTotal) * 100}%`;
   if (state.quadrature) renderEnergyTable(msg.regionEnergy, state.quadrature.regionEnergy);
+  renderLobes(msg.lobeEnergy, msg.lobeCounts);
+  renderHealth(msg.health);
   renderPaths(msg.records, msg.stats);
   if (state.overlay) requestOverlay();
+}
+
+function renderLobes(lobeEnergy, counts) {
+  const el = $('#lobe-out');
+  if (!el || !lobeEnergy) return;
+  const mean = (v) => (v[0] + v[1] + v[2]) / 3;
+  const c = mean(lobeEnergy.continuous);
+  const d = mean(lobeEnergy.delta);
+  el.innerHTML =
+    `continuous energy <b>${c.toFixed(3)}</b> (${counts ? counts.continuous : 0} hits) · ` +
+    `discrete Δ energy <b>${d.toFixed(3)}</b> (${counts ? counts.delta : 0} hits)`;
+}
+
+function renderHealth(health) {
+  const el = $('#health-out');
+  if (!el || !health) return;
+  const im = health.lightingImage ? 'yes' : 'no';
+  const nm = health.noiseMeasured ? 'yes' : 'no';
+  const lines = [
+    `lighting image: <b>${im}</b> · noise measured: <b>${nm}</b>` +
+    (health.deltaActive ? ' · discrete lobe active' : ''),
+  ];
+  if (health.issues && health.issues.length) {
+    for (const issue of health.issues) {
+      const cls = health.finite ? 'warn' : 'bad';
+      lines.push(`<span class="${cls}">⚠ ${escapeHtml(issue)}</span>`);
+    }
+  }
+  el.innerHTML = lines.join('<br>');
 }
 
 function renderEnergyTable(sampler, quad) {
@@ -316,9 +353,13 @@ function setRunningUI(running) {
 }
 
 function stopRun() {
+  // The worker finishes its current pass before it honours 'stop' (renderImage
+  // is synchronous). Re-enabling Start here would let a click land while the
+  // worker still has state.running = true, where it is silently dropped. Keep
+  // Start disabled until the worker posts 'done'; there is no ordering hazard
+  // because 'done' always follows a cancel.
   send({ type: 'stop' });
-  state.running = false;
-  setRunningUI(false);
+  $('#stop').disabled = true;
 }
 
 const RANGE_FORMAT = {
@@ -326,6 +367,7 @@ const RANGE_FORMAT = {
   'light-shift': (n) => n.toFixed(2),
   'sphere-rough': (n) => n.toFixed(2),
   'sphere-metal': (n) => n.toFixed(2),
+  'sphere-delta': (n) => n.toFixed(2),
   'boundary-u0': (n) => n.toFixed(2),
   'boundary-u1': (n) => n.toFixed(2),
   'boundary-v1': (n) => n.toFixed(2),
@@ -371,6 +413,8 @@ function applyScene() {
   state.cfg.lightShift = parseFloat($('#light-shift').value);
   state.cfg.roughness = parseFloat($('#sphere-rough').value);
   state.cfg.metallic = parseFloat($('#sphere-metal').value);
+  const dm = $('#sphere-delta');
+  if (dm) state.cfg.deltaMix = parseFloat(dm.value);
   send({ type: 'set-scene', cfg: cfgSnapshot() });
   setEngineStatus('Rebuilding scene…', '');
 }
@@ -399,6 +443,7 @@ function bindControls() {
   bindRange('light-shift', null);
   bindRange('sphere-rough', null);
   bindRange('sphere-metal', null);
+  bindRange('sphere-delta', (v) => { state.cfg.deltaMix = v; });
   bindRange('spp', (v) => { state.spp = Math.max(1, Math.round(v)); });
   bindRange('probe-x', (v) => { state.probe.x = Math.round(v); });
   bindRange('probe-y', (v) => { state.probe.y = Math.round(v); });

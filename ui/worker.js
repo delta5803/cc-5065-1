@@ -23,7 +23,7 @@ const state = {
 };
 
 function sceneKey(cfg) {
-  return JSON.stringify([cfg.width, cfg.height, cfg.lightScale, cfg.lightShift, cfg.roughness, cfg.metallic, cfg.zone]);
+  return JSON.stringify([cfg.width, cfg.height, cfg.lightScale, cfg.lightShift, cfg.roughness, cfg.metallic, cfg.deltaMix || 0, cfg.zone]);
 }
 
 // Rebuilds geometry when size/light/material change. When only the zone
@@ -31,7 +31,7 @@ function sceneKey(cfg) {
 function ensureScene(cfg) {
   const key = sceneKey(cfg);
   if (state.sceneKey === key && state.scene) return;
-  const geomKey = JSON.stringify([cfg.width, cfg.height, cfg.lightScale, cfg.lightShift, cfg.roughness, cfg.metallic]);
+  const geomKey = JSON.stringify([cfg.width, cfg.height, cfg.lightScale, cfg.lightShift, cfg.roughness, cfg.metallic, cfg.deltaMix || 0]);
   const prevGeom = state.geomKey;
   state.width = cfg.width;
   state.height = cfg.height;
@@ -40,7 +40,11 @@ function ensureScene(cfg) {
     state.scene = buildScene({
       lightScale: cfg.lightScale,
       lightOffset: [cfg.lightShift, 0],
-      sphereMaterial: { roughness: cfg.roughness, metallic: cfg.metallic },
+      sphereMaterial: {
+        roughness: cfg.roughness,
+        metallic: cfg.metallic,
+        deltaMix: cfg.deltaMix || 0,
+      },
     });
     state.controller = new ExposureController(state.scene, cfg.zone);
     state.geomKey = geomKey;
@@ -142,8 +146,11 @@ async function startRun(msg) {
   const accum = new Float64Array(state.width * state.height * 3);
   const accumSq = new Float64Array(state.width * state.height * 3);
   const regionAccum = { bright: [0, 0, 0], shared: [0, 0, 0], newOnly: [0, 0, 0], oldOnly: [0, 0, 0], dark: [0, 0, 0] };
+  const lobeAccum = { continuous: [0, 0, 0], delta: [0, 0, 0] };
+  const lobeCounts = { continuous: 0, delta: 0 };
   const stats = { lightSamples: 0, materialSamples: 0, lightZeroPdf: 0, materialZeroPdf: 0, occluded: 0, maskedHits: 0, escaped: 0 };
   let done = 0;
+  let lastGood = null;
   for (let p = 0; p < passes; p++) {
     if (state.cancelled) break;
     const t0 = Date.now();
@@ -154,6 +161,8 @@ async function startRun(msg) {
     addInto(accum, res.rgb);
     addSq(accumSq, res.rgb);
     for (const k of Object.keys(regionAccum)) add3(regionAccum[k], res.regionEnergy[k]);
+    for (const k of Object.keys(lobeAccum)) add3(lobeAccum[k], res.lobeEnergy[k]);
+    for (const k of Object.keys(lobeCounts)) lobeCounts[k] += res.counts[k] || 0;
     for (const k of Object.keys(stats)) stats[k] += res.stats[k] || 0;
     done++;
     const mean = new Float64Array(accum.length);
@@ -163,6 +172,17 @@ async function startRun(msg) {
     const noise = done >= 2 ? noiseAcrossPasses(accum, accumSq, done) : null;
     const regionEnergy = {};
     for (const k of Object.keys(regionAccum)) regionEnergy[k] = regionAccum[k].map(v => v / done);
+    const lobeEnergy = {};
+    for (const k of Object.keys(lobeAccum)) lobeEnergy[k] = lobeAccum[k].map(v => v / done);
+    const meanL = meanLuminance(mean);
+    // Run-health: make the "still rendering / image changing" state visible, and
+    // flag the anomalies the task calls out — a blank image, a NaN in the buffer,
+    // or a delta-lobe scene where no delta event could reach the emitter.
+    const health = assessRunHealth({
+      mean, meanL, done, noise, strategy, cfg,
+      lobeCounts, stats,
+    });
+    lastGood = health;
     self.postMessage({
       type: 'progress',
       rgb: mean,
@@ -170,11 +190,14 @@ async function startRun(msg) {
       passesTotal: passes,
       spp,
       strategy,
-      meanL: meanLuminance(mean),
+      meanL,
       noise,
       rmseRef: ref ? imageRMSE(mean, ref.rgb) : null,
       ms: Date.now() - t0,
       regionEnergy,
+      lobeEnergy,
+      lobeCounts: { ...lobeCounts },
+      health,
       stats: { ...stats },
       records: res.records,
       refRegionEnergy: ref ? ref.regionEnergy : null,
@@ -184,7 +207,37 @@ async function startRun(msg) {
     await new Promise(r => setTimeout(r, 0));
   }
   state.running = false;
-  self.postMessage({ type: 'done', passesDone: done });
+  self.postMessage({ type: 'done', passesDone: done, health: lastGood });
+}
+
+// Classify the run's state so the UI can show "running / image changing" and
+// surface lighting-image or noise anomalies rather than leaving them silent.
+function assessRunHealth({ mean, meanL, done, noise, strategy, cfg, lobeCounts, stats }) {
+  const issues = [];
+  let finite = true;
+  for (let i = 0; i < mean.length; i++) {
+    if (!Number.isFinite(mean[i])) { finite = false; break; }
+  }
+  if (!finite) issues.push('non-finite pixel value in the image buffer');
+  if (done >= 1 && !(meanL > 0)) issues.push('mean luminance is zero (blank lighting image)');
+  if (noise != null && !(noise >= 0)) issues.push('relative noise could not be measured');
+  const wantsDelta = (cfg.deltaMix || 0) > 0;
+  const materials = strategy !== 'light';
+  if (wantsDelta && materials && done >= 2 && lobeCounts.delta === 0) {
+    issues.push('material has a delta lobe but no discrete event reached the emitter (mirror ray misses the small light)');
+  }
+  if (wantsDelta && strategy === 'light' && done >= 2) {
+    issues.push('light-only cannot sample the delta lobe (point mass has zero area measure) — it is not part of this estimate');
+  }
+  return {
+    running: true,
+    lightingImage: done >= 1 && meanL > 0,
+    noiseMeasured: noise != null,
+    deltaActive: wantsDelta && lobeCounts.delta > 0,
+    lobeCounts: { ...lobeCounts },
+    finite,
+    issues,
+  };
 }
 
 function getReference(cfg, exposure) {

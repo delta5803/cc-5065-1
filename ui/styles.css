@@ -98,6 +98,9 @@ button.primary:hover:not(:disabled) { border-color: var(--accent); }
 .hint.good { color: var(--good); }
 .hint.bad { color: var(--bad); }
 .hint.warn { color: var(--warn); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.good { color: var(--good); }
 
 .canvas-stack figure { margin: 0; }
 .canvas-stack figcaption {
